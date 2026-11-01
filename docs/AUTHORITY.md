@@ -1,4 +1,4 @@
-﻿# Who decides what
+# Who decides what
 
 Phantom Pact runs two full copies of the single-player game, one per PC. Nothing is shared by default: each game
 simulates its own world. The mod then decides, per system, whose copy is the truth and what crosses the network.
@@ -14,7 +14,7 @@ Host = the player whose world is shared (Role = Host). Client = the guest.
 |---|---|---|---|---|
 | Your own player: movement, stamina, healing, items used | **That player** | own PC | snapshot `P` (position, facing, speed, health), 20x/s, newest wins | the other side only steers a ghost toward it, never simulates it |
 | Your own hits taken, your death | **That player** | own PC | health in `P`; hit reactions as `H` | the ghost is cosmetic: kept at full health on the host, its health shown, never killed |
-| Moves (attacks, dodges, guard) | **That player** | own PC | `M <ability>` when a move starts | the ghost replays it for the animation; the ghost has Attack 0 in co-op, and in PvP its hits on enemies are undone (below) |
+| Moves (attacks, dodges, guard) | **That player** | own PC | `M <ability>` and `U <montage> <position>` for a move | The receiver briefly buffers each `M`; a successful same-family `U` consumes only one matching fallback. Missing or unmatched montages leave the ability replay available. |
 | Enemy position, health, posture | **Host** | host simulates; client mirrors | snapshot `E` lines from the host, for enemies within 60 m of either player (so a client fighting far from the host still fights the host's enemy) | the client only ever lowers its copy to the host's numbers (or follows a heal the host keeps for 1 s) |
 | Enemy AI (which attack it throws) | each world | both | not synced | each world's enemy fights the players in it; outcomes (health, death) are the host's |
 | Client hits on enemies | **Client detects, host applies** | client measures its copy's drop, host applies it | reliable `D <enemy> <hp> <posture>` | event ids are acked and played once; a drop caused by the ghost's replay is undone, not reported |
@@ -142,6 +142,11 @@ Raised by appdoze (issue #1 / PR #2) and reworked from their code:
   "shared rewards" rule, applied late, not a duplicate.
 
 ## Known limits
+
+- Co-op combat is same-map and host-authoritative. The host sends only loaded enemies near either player's position; the client applies and reports only enemies present in that host snapshot. A guest-local enemy that has no host record is intentionally ignored for shared damage, so it cannot create a local-only kill or reward.
+- The player ghost's weapon/outfit is not yet part of the protocol. Move montages are synchronized, but a different equipped weapon can still leave the ghost holding the wrong weapon or empty hands. The PBZ equipment component/function must be identified in a live UE4SS dump before adding ghost-only equipment application; do not guess an `Equip*` call because inventory APIs can mutate saves.
+- The ghost's locomotion is driven by CharacterMovement. If a game update changes the Hun locomotion driver or AnimBP requirements, a runtime probe of CharacterMovement velocity and AnimInstance is required; the relay cannot manufacture a missing PBZ animation state.
+- A montage that cannot load/play leaves its matching ability (`M`) fallback available after a short wait. The `moves` command reports pending fallbacks and the last montage result.
 
 - If both players swing at the same enemy within the same 1.5 s in PvP, the ghost's replay can't be told from your
   own hit, so that drop is reported. It's harmless outside PvP, where the ghost does no damage.
