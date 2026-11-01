@@ -84,19 +84,37 @@ return function(api)
             return
         end
         idsRefreshedAt = now
-        spawnerIds = {}
+        local refreshed = {}
         for _, s in ipairs(FindAllOf("AISpawner") or {}) do
             pcall(function()
                 local a = s.SpawnedAI
                 if valid(a) then
-                    spawnerIds[a:GetAddress()] = "sp:" .. s.SpawnerID:ToString()
+                    local sid = s.SpawnerID:ToString()
+                    -- Empty/unassigned spawners expose FName_None as the literal "None". Treat it as absent;
+                    -- otherwise every such enemy collapses into the same sp:None network key.
+                    if sid and sid ~= "" and sid:lower() ~= "none" and not sid:find("%s") then
+                        refreshed[a:GetAddress()] = { id = "sp:" .. sid, actor = a }
+                    end
                 end
             end)
         end
+        local activeIds = {}
+        for _, entry in pairs(refreshed) do
+            activeIds[entry.id] = true
+        end
+        -- Keep an assigned id while its actor remains valid, even if the spawner clears SpawnedAI on death.
+        for addr, entry in pairs(spawnerIds) do
+            if refreshed[addr] == nil and not activeIds[entry.id] and valid(entry.actor) then
+                refreshed[addr] = entry
+                activeIds[entry.id] = true
+            end
+        end
+        spawnerIds = refreshed
     end
 
     function game.enemyId(actor)
-        return spawnerIds[actor:GetAddress()] or actor:GetFName():ToString()
+        local entry = spawnerIds[actor:GetAddress()]
+        return (entry and entry.id) or actor:GetFName():ToString()
     end
 
     function game.enemyClass(actor)
@@ -182,11 +200,29 @@ return function(api)
         bosses = {}
     end
 
-    -- Health_Min: the floor native damage can't push health below. The client holds its copies of the host's
-    -- enemies at 1 so only the host decides when one dies (coop.lua); 0 is the game's normal.
+    -- Restore each actor's previous floor when the temporary co-op authority lock ends.
+    local minHealthOriginals = {}
     function game.setMinHealth(actor, value)
         pcall(function()
+            local addr = actor:GetAddress()
             local m = actor.AttributeSetBase.Health_Min
+            if value == 0 then
+                local original = minHealthOriginals[addr]
+                if original and valid(original.actor) then
+                    m.BaseValue = original.base
+                    m.CurrentValue = original.current
+                    minHealthOriginals[addr] = nil
+                else
+                    minHealthOriginals[addr] = nil
+                    m.BaseValue = 0
+                    m.CurrentValue = 0
+                end
+                return
+            end
+            local original = minHealthOriginals[addr]
+            if not original or not valid(original.actor) then
+                minHealthOriginals[addr] = { actor = actor, base = m.BaseValue, current = m.CurrentValue }
+            end
             m.BaseValue = value
             m.CurrentValue = value
         end)
@@ -426,7 +462,7 @@ return function(api)
                 local name = cls:GetFName():ToString()
                 -- Only Hun's own moves (GA_Hun_Young_A, ..._AdvancedDash, ...); background abilities such as
                 -- GA_LocomotionDriver_3DDefault are always active and aren't moves.
-                if name:find("^GA_Hun") then
+                if name:find("^GA_Hun") and not name:find("Passive", 1, true) then
                     local path = cls:GetFullName():gsub("^%S+ ", "")
                     nowActive[path] = true
                     if not activeLocal[path] then
@@ -761,10 +797,40 @@ return function(api)
     -- The ghost is a full Hun: make it harmless (the remote player's hits arrive as reported damage) and let
     -- nearby enemies hate it so they fight it as well as the local player.
     function game.setupGhost(ghost)
+        local _, pawn = api.getPlayer1()
+        local ok, dst = pcall(function() return ghost.AttributeSetBase end)
+        if not ok or not dst then
+            log("Ghost setup: no AttributeSetBase.")
+            return
+        end
         pcall(function()
-            local atk = ghost.AttributeSetBase.Attack
+            local atk = dst.Attack
             atk.BaseValue = 0
             atk.CurrentValue = 0
+        end)
+        local src
+        if valid(pawn) then
+            pcall(function() src = pawn.AttributeSetBase end)
+        end
+        if not src then
+            log("Ghost setup: local AttributeSetBase unavailable; using default ghost attributes.")
+            return
+        end
+        for _, name in ipairs({ "Health_Max", "Shachi_Max", "Health", "Shachi" }) do
+            pcall(function()
+                local from, to = src[name], dst[name]
+                if from and to and type(from.CurrentValue) == "number" then
+                    to.BaseValue = from.CurrentValue
+                    to.CurrentValue = from.CurrentValue
+                end
+            end)
+        end
+        pcall(function()
+            local min = dst.Health_Min
+            if min then
+                min.BaseValue = 1
+                min.CurrentValue = 1
+            end
         end)
     end
 
@@ -1125,6 +1191,23 @@ return function(api)
     function game.mapName(contextActor)
         local ok, name = pcall(function() return api.gs():GetCurrentLevelName(contextActor, true):ToString() end)
         return ok and name or "?"
+    end
+
+    -- Level names can contain a package path, a PIE prefix, or a persistent-level suffix. Those are runtime
+    -- details and differ during streaming even when both players are in the same playable area. The normalized key
+    -- is sent over the wire; the original name is kept out of the protocol so a transient suffix cannot hide a ghost.
+    local function mapKeyName(name)
+        local s = tostring(name or "?"):gsub("\\", "/")
+        s = s:gsub("^.*[/]", "")
+        s = s:gsub("^UEDPIE_%d+_", "")
+        s = s:gsub("[_%-]PersistentLevel$", "")
+        s = s:gsub("[_%-]persistentlevel$", "")
+        return s ~= "" and s or "?"
+    end
+
+    game.mapKeyName = mapKeyName
+    function game.mapKey(contextActor)
+        return mapKeyName(game.mapName(contextActor))
     end
 
     ------------------------------------------------------------------ test helpers (commands)

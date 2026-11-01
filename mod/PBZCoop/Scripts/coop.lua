@@ -36,6 +36,8 @@ return function(api)
     local GHOST_SPEED_PER_CM = 3.0  -- speed per cm of distance to the target
     local GHOST_ACCELERATION = 2000 -- cm/s², P1 uses 210 but the ghost must react to network updates quickly
     local GHOST_SMOOTHING = 0.35  -- sphere ghost: fraction of the remaining distance covered per tick
+    local MAP_HIDE_DELAY_S = 2.0  -- streaming/PIE map-key changes must persist before hiding a live partner
+    local PARTNER_GONE_S = 12.0   -- longer than a loading screen (respawn teleport, streaming), which is silent too
     -- Dead reckoning: the ghost aims where the partner should be now, not where the last snapshot said, by
     -- extending their recent velocity. Capped, so a stop or turn costs at most a short overshoot. Velocity comes
     -- from snapshot numbers (the sender writes one every SNAPSHOT_S), not arrival times, which jitter.
@@ -71,12 +73,14 @@ return function(api)
         inOffset = 0,             -- bytes of net_events_in.txt already read
         inTail = "",              -- an incomplete last line (no "\n" yet), finished on a later read
         remoteEnemies = {},       -- client: name -> latest host record
+        mapMismatchSince = nil,   -- map mismatch must persist before the ghost is hidden
         deadSent = {},            -- host: enemy name -> true once its death was announced
         pendingDeaths = {},       -- client: host id -> true for a death announced while our copy wasn't loaded
         pendingBosses = {},       -- client: host id -> true for a boss fight announced before our copy was matched
         matchSticky = {},         -- client: host id -> address of the local actor matched to it by class/position
         foggedBosses = {},        -- boss id -> boss actor while we keep its arena's fog walls closed for the other player
         hostKilled = {},          -- client: host id -> true for each death the host announced since the last shared rest
+        unsharedHeld = {},        -- client: local-only actor held at Health_Min 1 until the host broadcasts it
         hostBosses = {},          -- client: host id -> true while the host's fight with that boss goes on
         heldAlive = {},           -- client: actor address -> actor held at Health_Min 1 (only the host kills it)
         healTicks = {},           -- client: host id -> snapshots in a row the host's health was clearly above ours
@@ -262,13 +266,20 @@ return function(api)
     end
 
     -- The ghost disappears while the remote player is dead (health 0) or on another map, and comes back when
-    -- they revive or arrive (the snap distance then moves it straight to them).
+    -- they revive or arrive. Map keys are normalized by pbz.lua and a short mismatch debounce covers streaming.
     local function updateGhostVisibility()
         if not valid(net.ghost) or net.target == nil then
             return
         end
         local t = net.target
-        local otherMap = t.Map ~= nil and net.localMap ~= nil and t.Map ~= "?" and net.localMap ~= "?" and t.Map ~= net.localMap
+        local mapKnown = t.Map ~= nil and net.localMap ~= nil and t.Map ~= "?" and net.localMap ~= "?"
+        local mapMismatch = mapKnown and t.Map ~= net.localMap
+        if mapMismatch then
+            net.mapMismatchSince = net.mapMismatchSince or os.clock()
+        else
+            net.mapMismatchSince = nil
+        end
+        local otherMap = mapMismatch and os.clock() - net.mapMismatchSince >= MAP_HIDE_DELAY_S
         -- Only "down" after a full second at 0 HP: a single 0 read during a teleport or loading hitch made the
         -- ghost flicker in the first live two-copy test.
         local zero = t.MaxHp ~= nil and t.MaxHp > 0 and t.Hp ~= nil and t.Hp <= 0
@@ -330,8 +341,10 @@ return function(api)
                 -- so pick the speed here: the further behind, the faster; never slower than the remote player.
                 local cmc = net.ghost.CharacterMovement
                 local want = math.max(GHOST_MIN_SPEED, dist * GHOST_SPEED_PER_CM, (t.Speed or 0) * 1.05)
-                cmc.MaxWalkSpeed = math.min(GHOST_MAX_SPEED, want)
+                want = math.min(GHOST_MAX_SPEED, want)
+                cmc.MaxWalkSpeed = want
                 cmc.MaxAcceleration = GHOST_ACCELERATION
+                pcall(function() cmc:SetMovementMode(MOVE_WALKING, 0) end)
                 net.ghost:AddMovementInput({ X = dx / dist, Y = dy / dist, Z = 0.0 }, 1.0, false)
             else
                 net.ghost:K2_SetActorRotation({ Pitch = 0.0, Yaw = t.Yaw, Roll = 0.0 }, false)
@@ -415,7 +428,10 @@ return function(api)
         end
         local hostSeen = {}
         local partner = nil
-        if net.target ~= nil and not net.ghostHidden then
+        local targetMap = net.target and net.target.Map
+        local sameMap = targetMap == nil or targetMap == "?" or net.localMap == nil or net.localMap == "?"
+            or targetMap == net.localMap
+        if net.target ~= nil and not net.partnerGone and sameMap then
             partner = { X = net.target.X, Y = net.target.Y, Z = net.target.Z }
         end
         for _, e in ipairs(localEnemies(origin, partner)) do
@@ -475,7 +491,8 @@ return function(api)
     -- Client: which local enemy is each of the host's? Same id first; then the actor this id was matched to
     -- before (sticky, while it's loaded and alive); otherwise the nearest still-unmatched local enemy of the same
     -- class within ENEMY_MATCH_CM (covers enemies whose ids differ between PCs). Ids go in sorted order, so two
-    -- same-class enemies pair up the same way every tick (pairs() order is arbitrary).
+    -- same-class enemies pair up the same way every tick (pairs() order is arbitrary). Unmatched local enemies are
+    -- intentionally excluded: only host-broadcast entities can be damaged in co-op.
     local function matchRemoteEnemies(locals)
         local byId, byAddr, used, matched = {}, {}, {}, {}
         for _, e in ipairs(locals) do
@@ -534,12 +551,9 @@ return function(api)
             end
         end
         net.matchSticky = sticky
-        -- Local enemies the host didn't mention keep their own id (their hits are still reported).
-        for _, e in ipairs(locals) do
-            if not used[e.addr] then
-                matched[enemyName(e.actor)] = e.actor
-            end
-        end
+        -- Do not add unmatched local enemies here. They belong to the guest's independent simulation and are not
+        -- valid targets in the host-authoritative session. Keeping them out prevents local-only kills and damage
+        -- reports that the host cannot route to an actor in its world.
         return matched
     end
 
@@ -566,21 +580,42 @@ return function(api)
     local HEAL_TICKS = 20
     local HELD_HP = 1             -- the floor the client's copies of host enemies are held at
 
-    -- keep: address -> actor still held this tick (nil releases every held copy).
-    local function releaseHeld(keep)
+    -- keep/keepUnshared: address -> actor still held this tick. nil releases every held copy.
+    local function releaseHeld(keep, keepUnshared)
         for addr, actor in pairs(net.heldAlive) do
-            if not (keep and keep[addr]) and valid(actor) and game.setMinHealth then
+            local retained = (keep and keep[addr]) or (keepUnshared and keepUnshared[addr])
+            if not retained and valid(actor) and game.setMinHealth then
+                game.setMinHealth(actor, 0)
+            end
+        end
+        for addr, actor in pairs(net.unsharedHeld) do
+            local retained = (keepUnshared and keepUnshared[addr]) or (keep and keep[addr])
+            if not retained and valid(actor) and game.setMinHealth then
                 game.setMinHealth(actor, 0)
             end
         end
         net.heldAlive = keep or {}
+        net.unsharedHeld = keepUnshared or {}
     end
 
     local function applyRemoteEnemies(origin)
         if game.refreshEnemyIds then
             game.refreshEnemyIds()
         end
-        enemyByName = matchRemoteEnemies(localEnemies(origin))
+        local locals = localEnemies(origin)
+        enemyByName = matchRemoteEnemies(locals)
+        local matchedAddrs, unshared = {}, {}
+        for _, actor in pairs(enemyByName) do
+            matchedAddrs[actor:GetAddress()] = true
+        end
+        for _, e in ipairs(locals) do
+            if not matchedAddrs[e.addr] and not (game.isDead and game.isDead(e.actor)) then
+                if game.setMinHealth then
+                    game.setMinHealth(e.actor, HELD_HP)
+                end
+                unshared[e.addr] = e.actor
+            end
+        end
         local nextSeen, held = {}, {}
         for name, actor in pairs(enemyByName) do
             local addr = actor:GetAddress()
@@ -658,7 +693,7 @@ return function(api)
         end
         seen = nextSeen
         -- Copies the host stopped sharing (it went out of range, or they're no longer matched) die normally again.
-        releaseHeld(held)
+        releaseHeld(held, unshared)
     end
 
     handlers.K = function(name)
@@ -890,7 +925,7 @@ return function(api)
         end
         net.seq = net.seq + 1
         if net.seq % 20 == 1 or net.localMap == nil then
-            net.localMap = game.mapName and game.mapName(pawn) or "?"
+            net.localMap = game.mapKey and game.mapKey(pawn) or (game.mapName and game.mapName(pawn) or "?")
         end
         -- Field 10 is the outfit in appdoze's fork ("-": we don't send one); field 11 is 1 while we're in a
         -- cutscene. Older versions ignore both.
@@ -942,7 +977,8 @@ return function(api)
                 if seq ~= nil and seq ~= net.lastRemoteSeq then
                     local t = { X = num(x), Y = num(y), Z = num(z), Yaw = num(yaw),
                         Speed = num(speed), Hp = num(hp), MaxHp = num(maxhp),
-                        Map = (map ~= nil and map ~= "") and map or nil,
+                        Map = (map ~= nil and map ~= "")
+                            and (game.mapKeyName and game.mapKeyName(map) or map) or nil,
                         Cine = cine == "1" }
                     -- A position that doesn't parse (or is NaN) is dropped, not applied.
                     if t.X and t.Y and t.Z and t.Yaw then
@@ -995,9 +1031,11 @@ return function(api)
     local function clearRemoteState()
         net.remoteEnemies = {}
         net.target = nil
+        net.localMap = nil
         net.lastRemoteSeq = nil
         net.lastRemoteAt = nil
         net.partnerGone = false
+        net.mapMismatchSince = nil
         net.vel = nil
         net.matchSticky = {}
         net.pendingDeaths = {}
@@ -1027,7 +1065,12 @@ return function(api)
         end
         net.role = role
         net.enabled = true
+        if game.spectate then
+            game.spectate(nil)
+        end
         reopenFog()
+        releaseHeld(nil)
+        destroyGhost()
         clearRemoteState()
         net.deadSent = {}
         -- A snapshot left over from before is not the peer's current state; the relay rewrites it on the next packet.
@@ -1064,6 +1107,45 @@ return function(api)
         log("Online sync off.")
     end
 
+    local function ghostDiag()
+        local ghost = net.ghost
+        if not valid(ghost) then
+            log("Ghost diagnostic: no valid remote ghost.")
+            return
+        end
+        local loc = ghost:K2_GetActorLocation()
+        local cmc = ghost.CharacterMovement
+        local velocity, maxSpeed, mode = nil, nil, nil
+        pcall(function() velocity = cmc.Velocity end)
+        pcall(function() maxSpeed = cmc.MaxWalkSpeed end)
+        pcall(function() mode = cmc.MovementMode end)
+        local speed = velocity and math.sqrt((velocity.X or 0)^2 + (velocity.Y or 0)^2 + (velocity.Z or 0)^2) or nil
+        local mesh = ghost.Mesh
+        local ai
+        pcall(function() ai = mesh:GetAnimInstance() end)
+        local montage = "-"
+        if valid(ai) then
+            pcall(function()
+                local active = ai:GetCurrentActiveMontage()
+                if valid(active) then montage = active:GetFullName() end
+            end)
+        end
+        log(string.format("Ghost diagnostic: loc=%s velocity=%s max_walk=%s movement_mode=%s hidden=%s anim=%s montage=%s",
+            fmtVec(loc), speed and string.format("%.1f", speed) or "?", tostring(maxSpeed), tostring(mode),
+            tostring(net.ghostHidden), valid(ai) and ai:GetClass():GetFullName() or "none", montage))
+        local count = 0
+        for _, comp in ipairs(FindAllOf("ActorComponent") or {}) do
+            if valid(comp) then
+                local ok, owner = pcall(function() return comp:GetOwner() end)
+                if ok and valid(owner) and owner:GetAddress() == ghost:GetAddress() then
+                    log("  component " .. comp:GetClass():GetFName():ToString() .. " " .. comp:GetFName():ToString())
+                    count = count + 1
+                end
+            end
+        end
+        log("Ghost components: " .. count)
+    end
+
     local function status()
         local relay = (readText(modDir() .. "net_status.txt") or "no status file (relay not running?)"):gsub("%s+$", "")
         log("Relay: " .. relay)
@@ -1071,14 +1153,19 @@ return function(api)
         for _ in pairs(net.remoteEnemies) do
             enemyCount = enemyCount + 1
         end
-        local heldCount = 0
+        local heldCount, unsharedCount = 0, 0
         for _ in pairs(net.heldAlive) do
             heldCount = heldCount + 1
         end
-        log(string.format("Mod: enabled=%s role=%s sent_seq=%d remote_seq=%s ghost=%s events_sent=%d events_in=%d remote_enemies=%d applied=%d hits_reported=%d hits_applied=%d ghost_hits_undone=%d held=%d",
-            tostring(net.enabled), net.role, net.seq, tostring(net.lastRemoteSeq), tostring(valid(net.ghost)),
+        for _ in pairs(net.unsharedHeld) do
+            unsharedCount = unsharedCount + 1
+        end
+        local snapshotAge = net.lastRemoteAt and math.max(0, os.clock() - net.lastRemoteAt) or -1
+        log(string.format("Mod: enabled=%s role=%s sent_seq=%d remote_seq=%s snapshot_age=%.1f ghost=%s hidden=%s local_map=%s remote_map=%s events_sent=%d events_in=%d remote_enemies=%d applied=%d hits_reported=%d hits_applied=%d ghost_hits_undone=%d held=%d unshared=%d",
+            tostring(net.enabled), net.role, net.seq, tostring(net.lastRemoteSeq), snapshotAge, tostring(valid(net.ghost)),
+            tostring(net.ghostHidden), tostring(net.localMap), tostring(net.target and net.target.Map),
             net.stats.sent, net.stats.received, enemyCount, net.stats.applied, net.stats.hitsReported or 0,
-            net.stats.hitsApplied or 0, net.stats.undone, heldCount))
+            net.stats.hitsApplied or 0, net.stats.undone, heldCount, unsharedCount))
         if valid(net.ghost) then
             local _, pawn = getPlayer1()
             local g = net.ghost:K2_GetActorLocation()
@@ -1106,22 +1193,35 @@ return function(api)
     local function clientEnemies()
         local _, pawn = getPlayer1()
         if not valid(pawn) then
-            return
-        end
-        -- The host is on another map: its enemies aren't ours, so leave ours alone (and start hit tracking over).
-        local t = net.target
-        if t ~= nil and t.Map ~= nil and net.localMap ~= nil and t.Map ~= "?" and net.localMap ~= "?"
-            and t.Map ~= net.localMap then
+            net.mapMismatchSince = nil
             seen = {}
             releaseHeld(nil)
             return
         end
+        local t = net.target
+        local fresh = t ~= nil and net.lastRemoteAt ~= nil and not net.partnerGone
+            and os.clock() - net.lastRemoteAt < PARTNER_GONE_S
+        local mapKnown = t ~= nil and t.Map ~= nil and net.localMap ~= nil and t.Map ~= "?" and net.localMap ~= "?"
+        if not fresh or not mapKnown then
+            net.mapMismatchSince = nil
+            seen = {}
+            releaseHeld(nil)
+            return
+        end
+        if t.Map ~= net.localMap then
+            net.mapMismatchSince = net.mapMismatchSince or os.clock()
+            -- Enemy actors from another map must never be matched by class/position in this world.
+            net.remoteEnemies = {}
+            seen = {}
+            releaseHeld(nil)
+            return
+        end
+        net.mapMismatchSince = nil
         applyRemoteEnemies(pawn:K2_GetActorLocation())
     end
 
     -- No new snapshot for a while: they quit, crashed or lost the connection. Their ghost mustn't stand there
     -- frozen, and nothing may stay locked for a fight that's no longer happening (fog walls, held enemies).
-    local PARTNER_GONE_S = 12.0   -- longer than a loading screen (respawn teleport, streaming), which is silent too
     local function watchPartner()
         local gone = net.lastRemoteAt ~= nil and os.clock() - net.lastRemoteAt >= PARTNER_GONE_S
         if gone and not net.partnerGone then
@@ -1229,6 +1329,7 @@ return function(api)
             neton = start,
             netoff = stop,
             netstatus = status,
+            ghostdiag = ghostDiag,
             -- "ghost clone" (default) or "ghost sphere"; respawns the ghost on the next update.
             ghost = function(mode)
                 if mode ~= "clone" and mode ~= "sphere" then
