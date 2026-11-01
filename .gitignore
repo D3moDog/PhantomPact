@@ -12,3 +12,5 @@ art/screenshots/*.png
 __pycache__/
 # C++ relay build output (tools/build-native.ps1)
 native/build/
+# doc files
+docs/
