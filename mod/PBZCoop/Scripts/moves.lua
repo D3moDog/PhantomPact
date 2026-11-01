@@ -22,7 +22,12 @@ return function(api)
     local MAX_NEW_LOADS_PER_MIN = 30
     local RESTART_S = 0.05          -- the same montage at an earlier position = played again
 
-    local moves = { sent = 0, played = 0, failed = 0, refused = 0, partnerSends = false }
+    local M_FALLBACK_DELAY_S = 0.45
+    local MOVE_MATCH_WINDOW_S = 0.45
+    local moves = { sent = 0, played = 0, failed = 0, refused = 0, partnerSends = false,
+        montageReady = false }
+    local pendingAbilities = {}
+    local recentMontages = {}
     local last, lastPos = nil, 0
     local cache = {}                -- montage path -> montage object, or false when it can't be loaded here
     local loads, loadsWindow = 0, os.clock()
@@ -107,7 +112,64 @@ return function(api)
         return cache[path] or nil
     end
 
+    local function syncSession()
+        if moves.session ~= net.inSession then
+            moves.session = net.inSession
+            moves.montageReady = false
+            pendingAbilities = {}
+            recentMontages = {}
+        end
+    end
+
+    local function family(path, segment)
+        return path and path:match("/" .. segment .. "/([^/]+)/") or nil
+    end
+
+    local function matchingAbility(path, now)
+        local wanted = family(path, "Montage")
+        local best
+        for i, item in ipairs(pendingAbilities) do
+            local age = now - item.at
+            local compatible = item.family ~= nil and wanted ~= nil and item.family == wanted
+            if not item.family or not wanted then
+                compatible = age <= 0.20
+            end
+            if compatible and age <= MOVE_MATCH_WINDOW_S then
+                best = i
+                break
+            end
+        end
+        if best then
+            table.remove(pendingAbilities, best)
+        end
+        recentMontages[#recentMontages + 1] = { family = wanted, at = now }
+        while recentMontages[1] and now - recentMontages[1].at > MOVE_MATCH_WINDOW_S do
+            table.remove(recentMontages, 1)
+        end
+    end
+
+    local function hasRecentMontage(path, now)
+        local wanted = family(path, "Abilities")
+        for i = #recentMontages, 1, -1 do
+            local item = recentMontages[i]
+            local age = now - item.at
+            if age > MOVE_MATCH_WINDOW_S then
+                table.remove(recentMontages, i)
+            else
+                local compatible = wanted ~= nil and item.family ~= nil and wanted == item.family
+                if not wanted or not item.family then
+                    compatible = age <= 0.20
+                end
+                if age >= 0 and compatible then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
     coop.handlers.U = function(rest)
+        syncSession()
         local path, pos = (rest or ""):match("^(%S+)%s+(%S+)$")
         pos = tonumber(pos)
         if not (allowedPath(path) and pos and pos == pos and pos >= 0 and pos < 600) then
@@ -122,32 +184,58 @@ return function(api)
         local ai = animOf(net.ghost)
         if not (m and ai) then
             moves.failed = moves.failed + 1
+            moves.montageReady = false
             return
         end
         local start = pos + (net.rttMs or 0) / 2000
-        local ok = pcall(function() ai:Montage_Play(m, 1.0, 0, start, true) end)
-        if ok then
+        local ok, duration = pcall(function() return ai:Montage_Play(m, 1.0, 0, start, true) end)
+        if ok and type(duration) == "number" and duration > 0 then
             moves.played = moves.played + 1
+            moves.montageReady = true
+            matchingAbility(path, os.clock())
             if game.noteGhostMove then
                 game.noteGhostMove()
             end
         else
             moves.failed = moves.failed + 1
+            moves.montageReady = false
         end
     end
 
-    -- Ability replays only until the partner sends montages (and always in PvP).
+    -- M often arrives just before its U. Buffer each event independently; a matching successful U consumes
+    -- only one fallback. Unrelated montages and later moves cannot discard the rest of the queue.
     local replayAbility = coop.handlers.M
     if replayAbility then
         coop.handlers.M = function(rest)
-            if moves.partnerSends and not net.pvp then
+            syncSession()
+            moves.partnerSends = true
+            local path = (rest or ""):match("^(%S+)")
+            if not path or path:find("Passive", 1, true) then
+                moves.refused = moves.refused + 1
                 return
             end
-            return replayAbility(rest)
+            if net.ghostHidden or not valid(net.ghost) then
+                return
+            end
+            local now = os.clock()
+            if hasRecentMontage(path, now) then
+                return
+            end
+            if #pendingAbilities < 80 then
+                pendingAbilities[#pendingAbilities + 1] = { rest = rest, at = now, family = family(path, "Abilities") }
+            end
         end
     end
 
     coop.extraTicks.moves = function()
+        syncSession()
+        local now = os.clock()
+        while pendingAbilities[1] and now - pendingAbilities[1].at >= M_FALLBACK_DELAY_S do
+            local pending = table.remove(pendingAbilities, 1)
+            if not net.ghostHidden and valid(net.ghost) and replayAbility then
+                replayAbility(pending.rest)
+            end
+        end
         local ok, err = pcall(watch)
         if not ok then
             last = nil
@@ -160,8 +248,9 @@ return function(api)
 
     -- moves: counters
     function moves.command()
-        log(string.format("Moves: sent %d, played on the ghost %d, failed %d, refused %d, partner sends montages: %s",
-            moves.sent, moves.played, moves.failed, moves.refused, tostring(moves.partnerSends)))
+        log(string.format("Moves: sent %d, played on the ghost %d, failed %d, refused %d, pending ability fallbacks %d, last montage succeeded: %s, partner sends montages: %s",
+            moves.sent, moves.played, moves.failed, moves.refused, #pendingAbilities, tostring(moves.montageReady),
+            tostring(moves.partnerSends)))
     end
 
     return moves

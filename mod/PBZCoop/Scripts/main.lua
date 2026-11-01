@@ -6,7 +6,7 @@
 -- F8  spawn player 2: a second local player + a copy of player 1's character (F8-F11 need PBZCOOP_DEBUG=1)
 -- F9  remove player 2
 
-local VERSION = "1.4.0"
+local VERSION = "1.4.0.1"
 local TAG = "[PBZCoop] "
 if (os.getenv("PBZCOOP_INSTANCE") or "1") ~= "1" then
     TAG = "[PBZCoop#" .. os.getenv("PBZCOOP_INSTANCE") .. "] "
@@ -97,9 +97,15 @@ local function dumpPlayer()
     log("Pawn: " .. pawn:GetFullName())
     log("Pawn class: " .. pawn:GetClass():GetFullName())
     log("Location: " .. fmtVec(pawn:K2_GetActorLocation()))
+    local mesh, ai
+    pcall(function()
+        mesh = pawn.Mesh
+        ai = mesh:GetAnimInstance()
+    end)
+    log("AnimInstance: " .. (valid(ai) and ai:GetClass():GetFullName() or "none"))
 
-    -- Every loaded component whose owner is this pawn. Scanning is slower than
-    -- K2_GetComponentsByClass, but it doesn't depend on how UE4SS returns TArrays.
+    -- Every loaded component whose owner is this pawn. Include likely equipment/weapon/mesh names for online
+    -- diagnosis; this remains read-only and never changes the player's inventory or save.
     local count = 0
     local all = FindAllOf("ActorComponent") or {}
     log("Components:")
@@ -107,7 +113,11 @@ local function dumpPlayer()
         if valid(comp) then
             local ok, owner = pcall(function() return comp:GetOwner() end)
             if ok and valid(owner) and owner:GetAddress() == pawn:GetAddress() then
-                log("  " .. comp:GetClass():GetFName():ToString() .. "  " .. comp:GetFName():ToString())
+                local componentClass = comp:GetClass():GetFName():ToString()
+                local componentName = comp:GetFName():ToString()
+                log(string.format("  %s%s  %s", (componentClass:find("[Ww]eapon") or componentClass:find("[Ee]quip")
+                    or componentName:find("[Ww]eapon") or componentName:find("[Ee]quip")) and "EQUIPMENT? " or "",
+                    componentClass, componentName))
                 count = count + 1
             end
         end
