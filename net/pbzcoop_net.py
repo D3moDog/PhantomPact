@@ -388,8 +388,13 @@ class Relay:
                 continue            # (RecursionError: one packet of 60000 "[" used to kill the relay)
             if not isinstance(msg, dict) or msg.get("v") != PROTOCOL:
                 continue
+            kind = msg.get("t")
             if self.role == "host" and self.peer != addr:
-                # Pinned to the first peer: another sender is only taken once the current one went silent.
+                # A host must not pin to a stale state packet. A candidate has to prove it is a live relay
+                # first; the next state packet then uses the address already pinned by ping/hello.
+                if kind not in ("ping", "hello"):
+                    continue
+                # Pinned to the first live peer: another sender is only taken once the current one went silent.
                 if self.peer is not None and now - self.last_heard <= PEER_TIMEOUT:
                     continue
                 self.peer = addr

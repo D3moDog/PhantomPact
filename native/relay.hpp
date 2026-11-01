@@ -637,7 +637,10 @@ private:
             if (!v || v->type != json::Value::Number || v->number != PROTOCOL) continue;
             const std::string* kind = msg.get_string("t");
             if (role_ == "host" && (!peer_ || *peer_ != addr)) {
-                // Pinned to the first peer: another sender is only taken once the current one went silent.
+                // Do not pin a host to a stale state packet. A candidate must first send ping/hello; its state
+                // packets are accepted after that address is pinned.
+                if (!kind || (*kind != "ping" && *kind != "hello")) continue;
+                // Pinned to the first live peer: another sender is only taken once the current one went silent.
                 if (peer_ && now - last_heard_ <= PEER_TIMEOUT) continue;
                 peer_ = addr;
                 log_("peer connected: " + link_->describe(addr));

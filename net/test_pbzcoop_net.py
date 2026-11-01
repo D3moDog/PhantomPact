@@ -375,6 +375,18 @@ class Security(unittest.TestCase):
             r.receive_all(time.monotonic())          # must not raise
             self.assertIsNone(r.rtt_ms)
 
+    def test_host_does_not_pin_to_a_state_packet_before_handshake(self):
+        relay = load_relay_module()
+        net = FakeSteamNet()
+        with tempfile.TemporaryDirectory() as tmp:
+            host = relay.Relay("host", tmp, None, 0, net.link(1, []))
+            net.inbox[1].append((2, json_bytes({"v": relay.PROTOCOL, "t": "state", "s": "P 1 0 0 0 0 0 850 850 M\n"})))
+            host.receive_all(time.monotonic())
+            self.assertIsNone(host.peer, "a stale state packet pinned the host")
+            net.inbox[1].append((2, json_bytes({"v": relay.PROTOCOL, "t": "ping", "ts": time.monotonic()})))
+            host.receive_all(time.monotonic())
+            self.assertEqual(host.peer, 2)
+
     def test_settings_mismatch_is_reported_and_values_are_cleaned(self):
         relay = load_relay_module()
         net = FakeSteamNet()
